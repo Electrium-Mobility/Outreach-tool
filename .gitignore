@@ -1,0 +1,96 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+
+# Python compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# IDE and Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# Environment and Configuration
+.env
+.env.local
+.env.*.local
+config.local.py
+
+# Database and Data Files
+outreach.db
+*.db
+*.sqlite
+*.sqlite3
+*.csv
+
+# Browser Automation
+.playwright/
+chromium/
+firefox/
+webkit/
+
+# Logs
+*.log
+logs/
+npm-debug.log
+
+# OS Specific
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Testing and Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.hypothesis/
+
+# Temporary and Build Files
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+.cache/
+
+# Node (if used for any JS integration)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# macOS
+.AppleDouble
+.LSOverride
+*.icloud
