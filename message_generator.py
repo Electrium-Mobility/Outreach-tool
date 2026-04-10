@@ -14,9 +14,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 try:
-    import openai
+    from openai import OpenAI
 except ImportError:  # pragma: no cover
-    openai = None  # type: ignore
+    OpenAI = None  # type: ignore
 
 
 @dataclass
@@ -41,7 +41,7 @@ def generate_message(name: str, headline: str, use_openai: bool = False) -> str:
     name = name.strip().split(" ")[0] if name.strip() else "there"
     clean_headline = _normalize_headline(headline)
 
-    if use_openai and openai is not None and os.getenv("OPENAI_API_KEY"):
+    if use_openai and OpenAI is not None and os.getenv("OPENAI_API_KEY"):
         return _generate_message_openai(name, clean_headline)
 
     return _generate_message_template(name, clean_headline)
@@ -70,10 +70,11 @@ def _generate_message_openai(name: str, headline: str) -> str:
     This is optional; without an API key the fallback template generator will be used.
     """
 
-    if openai is None:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if OpenAI is None or not api_key:
         return _generate_message_template(name, headline)
 
-    openai.api_key = os.getenv("OPENAI_API_KEY")
+    client = OpenAI(api_key=api_key)
 
     prompt = """You are helping a member of a student design team at the University of Waterloo reach out to students in Computer Science and Engineering.
 Generate a brief, friendly, human-sounding first message to send on LinkedIn. Mention the recipient's area of interest or study, but do not include links or anything that looks like a sales pitch. Keep it under 130 words.
@@ -84,16 +85,16 @@ Recipient headline: {headline}
 Message:
 """.format(name=name, headline=headline)
 
-    response = openai.ChatCompletion.create(
+    response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=220,
         temperature=0.8,
     )
 
-    text = response.choices[0].message.content.strip()
+    text = response.choices[0].message.content or ""
     # Make sure we never include a link in the first message.
-    return text.replace("http://", "").replace("https://", "")
+    return text.strip().replace("http://", "").replace("https://", "")
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
+from playwright_stealth import stealth_sync
 
 from dotenv import load_dotenv
 
@@ -41,42 +42,37 @@ class LinkedInProfile:
 
 def _create_db(path: str) -> None:
     """Create the SQLite database schema if it does not exist."""
-
-    conn = sqlite3.connect(path)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS profiles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            headline TEXT,
-            profile_url TEXT UNIQUE,
-            extracted_at REAL NOT NULL
+    with sqlite3.connect(path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                headline TEXT,
+                profile_url TEXT UNIQUE,
+                extracted_at REAL NOT NULL
+            )
+            """
         )
-        """
-    )
-    conn.commit()
-    conn.close()
+        conn.commit()
 
 
 def save_profiles_to_db(path: str, profiles: Iterable[LinkedInProfile]) -> None:
     """Save scraped profiles to an SQLite database (dedupes by profile_url)."""
 
     _create_db(path)
-    conn = sqlite3.connect(path)
-    cursor = conn.cursor()
-
-    for p in profiles:
-        try:
-            cursor.execute(
-                "INSERT OR IGNORE INTO profiles (name, headline, profile_url, extracted_at) VALUES (?, ?, ?, ?)",
-                (p.name, p.headline, p.profile_url, p.extracted_at),
-            )
-        except sqlite3.Error as e:
-            logger.warning("Failed to save profile %s: %s", p.profile_url, e)
-
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(path) as conn:
+        cursor = conn.cursor()
+        for p in profiles:
+            try:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO profiles (name, headline, profile_url, extracted_at) VALUES (?, ?, ?, ?)",
+                    (p.name, p.headline, p.profile_url, p.extracted_at),
+                )
+            except sqlite3.Error as e:
+                logger.warning("Failed to save profile %s: %s", p.profile_url, e)
+        conn.commit()
 
 
 def save_profiles_to_csv(path: str, profiles: Iterable[LinkedInProfile]) -> None:
@@ -103,28 +99,33 @@ def _build_search_url(query: str) -> str:
 def _extract_profiles_from_page(page: Page) -> List[LinkedInProfile]:
     """Extract name+headline+profile URL from a search results page."""
 
-    # LinkedIn markup is subject to change; these CSS selectors are common but can break.
-    cards = page.locator("div.search-result__info")
+    # Updated selectors for modern LinkedIn UI
+    page.wait_for_selector(".reusable-search__result-container", timeout=10000)
+    cards = page.locator(".reusable-search__result-container")
     profiles: List[LinkedInProfile] = []
 
     for i in range(cards.count()):
         card = cards.nth(i)
 
         # Name and profile link usually exist under <a> inside the card.
-        handle = card.locator("a.app-aware-link")
+        handle = card.locator(".entity-result__title-text a").first
         if handle.count() == 0:
             continue
 
-        profile_url = handle.get_attribute("href") or ""
-        name = handle.locator("span[aria-hidden='true']").first.inner_text().strip() if handle.locator("span[aria-hidden='true']").count() else ""
-
+        try:
+            profile_url = handle.get_attribute("href") or ""
+            name = handle.locator("span[aria-hidden='true']").inner_text().strip()
+        except Exception as e:
+            logger.debug("Failed to extract card details: %s", e)
+            continue
+            
         if not profile_url:
             continue
 
         headline = ""
-        headline_el = card.locator("p.subline-level-1")
+        headline_el = card.locator(".entity-result__primary-subtitle")
         if headline_el.count() > 0:
-            headline = headline_el.first.inner_text().strip()
+            headline = headline_el.inner_text().strip()
 
         profiles.append(LinkedInProfile(name=name, headline=headline, profile_url=profile_url, extracted_at=time.time()))
 
@@ -158,21 +159,42 @@ def scrape_linkedin_search(
         )
 
     launcher = sync_playwright().start()
-    browser: Browser = getattr(launcher, browser_name).launch(headless=headless)
-    context: BrowserContext = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                                                   "(KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36")
-    page: Page = context.new_page()
+    
+    # Define where to store cookies and session data
+    user_data_dir = os.path.join(os.getcwd(), "playwright_session")
+    
+    # Launch persistent context instead of a fresh browser
+    # This saves your login state so you don't get flagged for new logins
+    context = launcher.chromium.launch_persistent_context(
+        user_data_dir,
+        headless=headless,
+        args=["--disable-blink-features=AutomationControlled"],
+    )
+    
+    # Use the first page or create one
+    page = context.pages[0] if context.pages else context.new_page()
+    
+    # Apply stealth to the page
+    stealth_sync(page)
 
-    logger.info("Logging into LinkedIn")
-    page.goto("https://www.linkedin.com/login")
-    page.fill("input[name='session_key']", linkedin_email)
-    page.fill("input[name='session_password']", linkedin_password)
-    page.click("button[type='submit']")
-
-    # Wait for navigation and ensure login succeeded.
+    logger.info("Checking LinkedIn session...")
+    page.goto("https://www.linkedin.com/feed")
     page.wait_for_load_state("networkidle")
-    if "feed" not in page.url and "checkpoint" in page.url:
-        raise RuntimeError("LinkedIn login failed; checkpoint or MFA may be required.")
+
+    # If not logged in, perform login
+    if "login" in page.url or "checkpoint" in page.url:
+        logger.info("Session expired or missing. Logging in...")
+        page.goto("https://www.linkedin.com/login")
+        page.fill("input[name='session_key']", linkedin_email)
+        page.fill("input[name='session_password']", linkedin_password)
+        page.click("button[type='submit']")
+        page.wait_for_load_state("networkidle")
+
+    if "feed" not in page.url:
+        logger.warning("Still not on feed. You may need to solve a CAPTCHA manually in the browser window.")
+        # Keep the window open for manual intervention if not headless
+        if not headless:
+             page.wait_for_url("https://www.linkedin.com/feed/", timeout=60000)
 
     search_url = _build_search_url(query)
     page.goto(search_url)
@@ -218,7 +240,6 @@ def scrape_linkedin_search(
         logger.info("Saved %d profiles to CSV %s", len(collected), output_csv)
 
     context.close()
-    browser.close()
     launcher.stop()
 
     return collected

@@ -20,7 +20,7 @@ import random
 import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -44,54 +44,46 @@ class OutreachMessage:
 
 def init_outreach_db(path: str) -> None:
     """Initialize the outreach database schema."""
+    with sqlite3.connect(path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """CREATE TABLE IF NOT EXISTS profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                headline TEXT,
+                profile_url TEXT UNIQUE,
+                extracted_at REAL NOT NULL
+            )"""
+        )
 
-    conn = sqlite3.connect(path)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """CREATE TABLE IF NOT EXISTS profiles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            headline TEXT,
-            profile_url TEXT UNIQUE,
-            extracted_at REAL NOT NULL
-        )"""
-    )
-
-    cursor.execute(
-        """CREATE TABLE IF NOT EXISTS outreach (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            profile_id INTEGER NOT NULL,
-            message_text TEXT NOT NULL,
-            created_at REAL NOT NULL,
-            sent_at REAL,
-            UNIQUE(profile_id)
-        )"""
-    )
-
-    conn.commit()
-    conn.close()
+        cursor.execute(
+            """CREATE TABLE IF NOT EXISTS outreach (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id INTEGER NOT NULL,
+                message_text TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                sent_at REAL,
+                UNIQUE(profile_id)
+            )"""
+        )
+        conn.commit()
 
 
 def load_profiles(db_path: str, limit: Optional[int] = None) -> Sequence[dict]:
     """Load profiles from the database, optionally limiting how many to return."""
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        query = "SELECT id, name, headline, profile_url FROM profiles ORDER BY extracted_at DESC"
+        if limit:
+            query += " LIMIT ?"
+            cursor.execute(query, (limit,))
+        else:
+            cursor.execute(query)
+        rows = cursor.fetchall()
 
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    query = "SELECT id, name, headline, profile_url FROM profiles ORDER BY extracted_at DESC"
-    if limit:
-        query += " LIMIT ?"
-        cursor.execute(query, (limit,))
-    else:
-        cursor.execute(query)
-
-    rows = cursor.fetchall()
-    conn.close()
-
-    return [
-        {"id": row[0], "name": row[1], "headline": row[2] or "", "profile_url": row[3]} for row in rows
-    ]
+        return [
+            {"id": row[0], "name": row[1], "headline": row[2] or "", "profile_url": row[3]} for row in rows
+        ]
 
 
 def _profile_message_exists(conn: sqlite3.Connection, profile_id: int) -> bool:
@@ -112,47 +104,40 @@ def enqueue_messages(
     """
 
     init_outreach_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        created = 0
+        for profile in profiles:
+            if max_per_run and created >= max_per_run:
+                break
 
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+            profile_id = profile["id"]
+            if _profile_message_exists(conn, profile_id):
+                continue
 
-    created = 0
-    for profile in profiles:
-        if max_per_run and created >= max_per_run:
-            break
-
-        profile_id = profile["id"]
-        if _profile_message_exists(conn, profile_id):
-            continue
-
-        text = generate_message(profile["name"], profile["headline"], use_openai=use_openai)
-        cursor.execute(
-            "INSERT OR IGNORE INTO outreach (profile_id, message_text, created_at) VALUES (?, ?, ?)",
-            (profile_id, text, time.time()),
-        )
-        created += 1
-
-    conn.commit()
-    conn.close()
-    logger.info("Enqueued %d new messages", created)
-    return created
+            text = generate_message(profile["name"], profile["headline"], use_openai=use_openai)
+            cursor.execute(
+                "INSERT OR IGNORE INTO outreach (profile_id, message_text, created_at) VALUES (?, ?, ?)",
+                (profile_id, text, time.time()),
+            )
+            created += 1
+        conn.commit()
+        logger.info("Enqueued %d new messages", created)
+        return created
 
 
 def list_pending_messages(db_path: str, limit: Optional[int] = None) -> Sequence[OutreachMessage]:
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    query = "SELECT o.id, p.id, p.name, p.headline, p.profile_url, o.message_text, o.created_at, o.sent_at "
-    query += "FROM outreach o JOIN profiles p ON o.profile_id = p.id "
-    query += "WHERE o.sent_at IS NULL ORDER BY o.created_at ASC"
-    if limit:
-        query += " LIMIT ?"
-        cursor.execute(query, (limit,))
-    else:
-        cursor.execute(query)
-
-    rows = cursor.fetchall()
-    conn.close()
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        query = "SELECT o.id, p.id, p.name, p.headline, p.profile_url, o.message_text, o.created_at, o.sent_at "
+        query += "FROM outreach o JOIN profiles p ON o.profile_id = p.id "
+        query += "WHERE o.sent_at IS NULL ORDER BY o.created_at ASC"
+        if limit:
+            query += " LIMIT ?"
+            cursor.execute(query, (limit,))
+        else:
+            cursor.execute(query)
+        rows = cursor.fetchall()
 
     return [
         OutreachMessage(
@@ -175,7 +160,7 @@ def _mark_sent(conn: sqlite3.Connection, outreach_id: int) -> None:
 
 
 def _daily_sent_count(conn: sqlite3.Connection, date: datetime) -> int:
-    start = datetime(date.year, date.month, date.day)
+    start = datetime(date.year, date.month, date.day, tzinfo=timezone.utc)
     end = start + timedelta(days=1)
 
     cursor = conn.cursor()
@@ -203,42 +188,39 @@ def send_outreach(
     """
 
     init_outreach_db(db_path)
-    conn = sqlite3.connect(db_path)
+    with sqlite3.connect(db_path) as conn:
+        sent_today = _daily_sent_count(conn, datetime.now(timezone.utc))
+        if sent_today >= daily_cap:
+            logger.info("Daily cap reached (%d/%d). No messages will be sent.", sent_today, daily_cap)
+            return 0
 
-    sent_today = _daily_sent_count(conn, datetime.utcnow())
-    if sent_today >= daily_cap:
-        logger.info("Daily cap reached (%d/%d). No messages will be sent.", sent_today, daily_cap)
-        conn.close()
-        return 0
+        allowed = daily_cap - sent_today
+        if max_to_send is not None:
+            allowed = min(allowed, max_to_send)
 
-    allowed = daily_cap - sent_today
-    if max_to_send is not None:
-        allowed = min(allowed, max_to_send)
+        pending = list_pending_messages(db_path, limit=allowed)
+        logger.info("Preparing to send %d messages (daily cap %d, sent today %d)", len(pending), daily_cap, sent_today)
 
-    pending = list_pending_messages(db_path, limit=allowed)
-    logger.info("Preparing to send %d messages (daily cap %d, sent today %d)", len(pending), daily_cap, sent_today)
+        sent_count = 0
+        for item in pending:
+            # Simulate the action of sending (manual or via platform if integrated)
+            logger.info("----\nTo: %s\nProfile: %s\nMessage: %s\n", item.profile_name, item.profile_url, item.message_text)
+            if not dry_run:
+                # In a real system, here is where you'd integrate with a browser automation step or API.
+                _mark_sent(conn, outreach_id=item.outreach_id)
+                conn.commit()
+                sent_count += 1
 
-    sent_count = 0
-    for item in pending:
-        # Simulate the action of sending (manual or via platform if integrated)
-        logger.info("----\nTo: %s\nProfile: %s\nMessage: %s\n", item.profile_name, item.profile_url, item.message_text)
-        if not dry_run:
-            # In a real system, here is where you'd integrate with a browser automation step or API.
-            _mark_sent(conn, outreach_id=item.outreach_id)
-            conn.commit()
-            sent_count += 1
+                # Rate limiting: random delay between sends.
+                delay = random.uniform(min_delay_s, max_delay_s)
+                logger.info("Sleeping %.1f seconds before next message", delay)
+                if allow_sleep:
+                    time.sleep(delay)
+            else:
+                # In dry-run mode, just log and do not mark as sent.
+                sent_count += 0
 
-            # Rate limiting: random delay between sends.
-            delay = random.uniform(min_delay_s, max_delay_s)
-            logger.info("Sleeping %.1f seconds before next message", delay)
-            if allow_sleep:
-                time.sleep(delay)
-        else:
-            # In dry-run mode, just log and do not mark as sent.
-            sent_count += 0
-
-    conn.close()
-    return sent_count
+        return sent_count
 
 
 if __name__ == "__main__":
